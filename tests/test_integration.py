@@ -252,13 +252,7 @@ class TestAnalysisTop10Products:
 
     def test_quantities_are_positive(self, dag_run_id):
         bad = _pg_scalar(
-            "SELECT COUNT(*) FROM analysis_top10_products WHERE total_quantity <= 0"
-        )
-        assert bad == 0
-
-    def test_revenue_is_positive(self, dag_run_id):
-        bad = _pg_scalar(
-            "SELECT COUNT(*) FROM analysis_top10_products WHERE total_revenue <= 0"
+            "SELECT COUNT(*) FROM analysis_top10_products WHERE quantity_sold <= 0"
         )
         assert bad == 0
 

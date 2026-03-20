@@ -123,17 +123,20 @@ def get_top_10_products(df: DataFrame) -> DataFrame:
     """
     Return the top 10 products by total quantity sold.
 
-    Ties in quantity are broken by total revenue (descending) to surface the
-    highest-value items in case of identical sales volumes.
+    Output columns: stock_code, quantity_sold.
+    Revenue is computed internally only as a tiebreaker when two products
+    share the same quantity; it is not included in the output.
     """
     return (
-        df.groupBy("stock_code", "description")
+        df.filter(F.col("stock_code") != "UNKNOWN")
+        .groupBy("stock_code")
         .agg(
-            F.sum("quantity").alias("total_quantity"),
-            F.round(F.sum("revenue"), 2).alias("total_revenue"),
+            F.sum("quantity").alias("quantity_sold"),
+            F.sum("revenue").alias("_revenue_tiebreaker"),
         )
-        .orderBy(F.desc("total_quantity"), F.desc("total_revenue"))
+        .orderBy(F.desc("quantity_sold"), F.desc("_revenue_tiebreaker"))
         .limit(10)
+        .drop("_revenue_tiebreaker")
     )
 
 
@@ -144,18 +147,24 @@ def get_top_10_products(df: DataFrame) -> DataFrame:
 
 def get_monthly_revenue_trend(df: DataFrame) -> DataFrame:
     """
-    Aggregate revenue by calendar month and compute month-over-month (MoM)
+    Aggregate net revenue by calendar month and compute month-over-month (MoM)
     growth rate.
+
+    All transactions are included — cancellations carry negative revenue and
+    are summed in so the result is net monthly revenue (gross sales minus
+    returns), not gross-only.  The only pre-filter applied is removing rows
+    with a null invoice_date, which cannot be assigned to any month.
 
     Columns returned:
       year_month       – 'YYYY-MM' label
-      monthly_revenue  – sum of revenue for the month
-      num_transactions – count of distinct invoices
+      monthly_revenue  – net sum of revenue for the month (sales minus returns)
+      num_transactions – count of distinct invoices (including cancellations)
       num_customers    – count of distinct (anonymised) customer IDs
       mom_growth_pct   – percentage change vs the previous month (null for first month)
     """
     monthly = (
-        df.withColumn("year_month", F.date_format("invoice_date", "yyyy-MM"))
+        df.filter(F.col("invoice_date").isNotNull())
+        .withColumn("year_month", F.date_format("invoice_date", "yyyy-MM"))
         .groupBy("year_month")
         .agg(
             F.round(F.sum("revenue"), 2).alias("monthly_revenue"),
@@ -165,8 +174,11 @@ def get_monthly_revenue_trend(df: DataFrame) -> DataFrame:
         .orderBy("year_month")
     )
 
-    # Month-over-month growth using a lag window ordered by the month label
-    w = Window.orderBy("year_month")
+    # Month-over-month growth using a lag window ordered by the month label.
+    # partitionBy(lit(0)) puts all rows in one explicit partition, suppressing
+    # the "No Partition Defined for Window operation" warning that Spark emits
+    # when orderBy is used without partitionBy.
+    w = Window.partitionBy(F.lit(0)).orderBy("year_month")
     monthly = (
         monthly
         .withColumn("prev_revenue", F.lag("monthly_revenue").over(w))
@@ -299,10 +311,10 @@ def main() -> None:
     save_to_postgres(top10, "analysis_top10_products")
 
     # ------------------------------------------------------------------
-    # 3. Monthly revenue trend
+    # 3. Monthly revenue trend (net: includes cancellations)
     # ------------------------------------------------------------------
     print("\n[Analysis 3] Monthly Revenue Trend:")
-    monthly = get_monthly_revenue_trend(valid_df)
+    monthly = get_monthly_revenue_trend(df)
     print_monthly_insights(monthly)
     save_to_postgres(monthly, "analysis_monthly_revenue")
 

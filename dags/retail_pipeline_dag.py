@@ -5,6 +5,7 @@ Airflow DAG that orchestrates the Online Retail data pipeline on a daily
 schedule.
 
 Pipeline graph:
+
                                     ┌─► run_pyspark_analysis
     ingest_and_clean ───────────────┤
                                     ├─► sql_top_3_products_last_6m
@@ -19,27 +20,31 @@ Tasks:
      Reads from PostgreSQL and computes total revenue, top-10 products, and
      the monthly revenue trend.  Results are written back to analysis tables.
 
-  3. sql_top_3_products_last_6m  – PostgresOperator
-     Runs the window-function query that returns the top 3 products by
-     revenue for each month over the last 6 months of data.
+  3. sql_top_3_products_last_6m  – PythonOperator
+     Reads sql/top_3_products_last_6m.sql, executes it once via psycopg2,
+     and logs a sample of the result rows.
 
-  4. sql_rolling_3m_avg_australia – PostgresOperator
-     Computes the rolling 3-month average revenue for Australia.
+  4. sql_rolling_3m_avg_australia – PythonOperator
+     Reads sql/rolling_3m_avg_australia.sql, executes it once via psycopg2,
+     and logs a sample of the result rows.
 
 Connections expected in Airflow (set via env vars in docker-compose):
   • spark_default   → spark://spark-master:7077
-  • postgres_retail → postgresql+psycopg2://retail:retail@postgres:5432/retail
+  • postgres_retail → retail database on the postgres service
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from airflow import DAG
+from airflow.operators.python import PythonOperator
 from airflow.providers.apache.spark.operators.spark_submit import (
     SparkSubmitOperator,
 )
-from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 # ---------------------------------------------------------------------------
 # Connection IDs (must match the Airflow connections configured in
@@ -51,8 +56,16 @@ POSTGRES_CONN_ID: str = "postgres_retail"
 # Path to PySpark job scripts inside the Airflow container
 SPARK_JOBS_DIR: str = "/opt/airflow/spark/jobs"
 
+# Path to SQL files inside the Airflow container (mounted from ./sql/)
+SQL_DIR: Path = Path("/opt/airflow/sql")
+
 # Maven coordinates for the PostgreSQL JDBC driver (downloaded at submit time)
 JDBC_PACKAGE: str = "org.postgresql:postgresql:42.7.1"
+
+# Number of sample rows to log after each SQL query executes
+_SAMPLE_ROWS: int = 10
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Default task arguments
@@ -68,83 +81,6 @@ DEFAULT_ARGS = {
 }
 
 # ---------------------------------------------------------------------------
-# Embedded SQL for the PostgresOperator tasks
-# (mirrors what is in sql/analysis.sql for pipeline-internal use)
-# ---------------------------------------------------------------------------
-
-_SQL_TOP_3_PRODUCTS = """
-WITH dataset_max_date AS (
-    SELECT MAX(invoice_date) AS max_dt
-    FROM   retail_transactions
-),
-last_6_months_window AS (
-    SELECT max_dt,
-           max_dt - INTERVAL '6 months' AS window_start
-    FROM   dataset_max_date
-),
-monthly_product_revenue AS (
-    SELECT
-        DATE_TRUNC('month', t.invoice_date)::DATE  AS month,
-        t.stock_code,
-        t.description,
-        SUM(t.revenue)                             AS total_revenue
-    FROM   retail_transactions t
-    CROSS  JOIN last_6_months_window w
-    WHERE  t.invoice_date  >  w.window_start
-      AND  t.invoice_date  <= w.max_dt
-      AND  t.is_cancellation = FALSE
-      AND  t.revenue         > 0
-    GROUP  BY 1, 2, 3
-),
-ranked AS (
-    SELECT
-        month,
-        stock_code,
-        description,
-        total_revenue,
-        RANK() OVER (
-            PARTITION BY month
-            ORDER BY     total_revenue DESC
-        ) AS revenue_rank
-    FROM  monthly_product_revenue
-)
-SELECT
-    TO_CHAR(month, 'YYYY-MM')        AS month,
-    stock_code,
-    description,
-    ROUND(total_revenue::NUMERIC, 2) AS total_revenue_gbp,
-    revenue_rank
-FROM   ranked
-WHERE  revenue_rank <= 3
-ORDER  BY month DESC, revenue_rank;
-"""
-
-_SQL_ROLLING_AVG_AUSTRALIA = """
-WITH monthly_australia AS (
-    SELECT
-        DATE_TRUNC('month', invoice_date)::DATE  AS month,
-        SUM(revenue)                             AS monthly_revenue
-    FROM   retail_transactions
-    WHERE  country         = 'Australia'
-      AND  is_cancellation = FALSE
-      AND  revenue         > 0
-    GROUP  BY 1
-)
-SELECT
-    TO_CHAR(month, 'YYYY-MM')                        AS month,
-    ROUND(monthly_revenue::NUMERIC, 2)               AS monthly_revenue_gbp,
-    ROUND(
-        AVG(monthly_revenue) OVER (
-            ORDER BY month
-            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-        )::NUMERIC,
-        2
-    )                                                AS rolling_3m_avg_gbp
-FROM   monthly_australia
-ORDER  BY month;
-"""
-
-# ---------------------------------------------------------------------------
 # Shared Spark configuration
 # ---------------------------------------------------------------------------
 _SPARK_CONF = {
@@ -155,6 +91,59 @@ _SPARK_CONF = {
     "spark.executor.memory": "2g",
     "spark.driver.memory": "2g",
 }
+
+# ---------------------------------------------------------------------------
+# SQL task helper
+# ---------------------------------------------------------------------------
+
+
+def _ascii_table(columns: list[str], rows: list[tuple]) -> str:
+    """Format *rows* as an ASCII table with *columns* as headers."""
+    widths = [len(c) for c in columns]
+    for row in rows:
+        for i, val in enumerate(row):
+            widths[i] = max(widths[i], len(str(val)))
+    sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+    header = "|" + "|".join(f" {c:<{w}} " for c, w in zip(columns, widths)) + "|"
+    lines = [sep, header, sep]
+    for row in rows:
+        lines.append("|" + "|".join(f" {str(v):<{w}} " for v, w in zip(row, widths)) + "|")
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+def _run_sql_and_log(sql_filename: str, postgres_conn_id: str) -> None:
+    """Read *sql_filename* from SQL_DIR, execute it once, and log sample rows.
+
+    Using psycopg2 directly (via PostgresHook) guarantees a single execution
+    and gives us access to the cursor so we can fetch and log result rows.
+    PostgresOperator would log the query text and then execute it, but does
+    not expose the result set for logging.
+    """
+    sql_path = SQL_DIR / sql_filename
+    sql = sql_path.read_text()
+
+    _LOG.info("Executing SQL file: %s", sql_path)
+
+    hook = PostgresHook(postgres_conn_id=postgres_conn_id)
+    conn = hook.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            # SELECT queries: fetch and log a sample of result rows.
+            if cur.description is not None:
+                columns = [desc[0] for desc in cur.description]
+                rows = cur.fetchmany(_SAMPLE_ROWS)
+                _LOG.info(
+                    "Sample data from %s (first %d row(s)):\n%s",
+                    sql_filename,
+                    len(rows),
+                    _ascii_table(columns, rows),
+                )
+            conn.commit()
+    finally:
+        conn.close()
+
 
 # ---------------------------------------------------------------------------
 # DAG definition
@@ -202,19 +191,25 @@ with DAG(
     # ------------------------------------------------------------------
     # Task 3 – SQL: top 3 products per month (last 6 months)
     # ------------------------------------------------------------------
-    sql_top_products = PostgresOperator(
+    sql_top_products = PythonOperator(
         task_id="sql_top_3_products_last_6m",
-        postgres_conn_id=POSTGRES_CONN_ID,
-        sql=_SQL_TOP_3_PRODUCTS,
+        python_callable=_run_sql_and_log,
+        op_kwargs={
+            "sql_filename": "top_3_products_last_6m.sql",
+            "postgres_conn_id": POSTGRES_CONN_ID,
+        },
     )
 
     # ------------------------------------------------------------------
     # Task 4 – SQL: rolling 3-month average revenue for Australia
     # ------------------------------------------------------------------
-    sql_rolling_avg = PostgresOperator(
+    sql_rolling_avg = PythonOperator(
         task_id="sql_rolling_3m_avg_australia",
-        postgres_conn_id=POSTGRES_CONN_ID,
-        sql=_SQL_ROLLING_AVG_AUSTRALIA,
+        python_callable=_run_sql_and_log,
+        op_kwargs={
+            "sql_filename": "rolling_3m_avg_australia.sql",
+            "postgres_conn_id": POSTGRES_CONN_ID,
+        },
     )
 
     # ------------------------------------------------------------------

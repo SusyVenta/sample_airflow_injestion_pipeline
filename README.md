@@ -19,8 +19,9 @@ End-to-end data pipeline using **Apache Spark**, **Apache Airflow**, and **Postg
 │       ├── clean_and_ingest.py     # PySpark: cleaning, PII anonymisation, PostgreSQL write
 │       └── analysis.py             # PySpark: total revenue, top-10 products, monthly trend
 ├── sql/
-│   ├── init_db.sh                  # Creates airflow + retail databases on first Postgres start
-│   └── analysis.sql                # SQL: top-3 products (last 6 months), rolling avg Australia
+│   ├── init_db.sh                      # Creates airflow + retail databases on first Postgres start
+│   ├── top_3_products_last_6m.sql      # SQL: top-3 products by revenue per month (last 6 months)
+│   ├── rolling_3m_avg_australia.sql    # SQL: rolling 3-month average revenue for Australia
 ├── tests/
 │   ├── conftest.py                 # Shared SparkSession fixture + helpers
 │   ├── test_cleaning.py            # Unit tests for cleaning functions

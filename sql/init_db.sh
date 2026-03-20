@@ -2,8 +2,23 @@
 # =============================================================================
 # init_db.sh
 # Runs once on first PostgreSQL container start (mounted into
-# /docker-entrypoint-initdb.d/).  Creates the `airflow` and `retail`
-# databases with dedicated users.
+# /docker-entrypoint-initdb.d/).  Creates two logically separate databases
+# on the shared PostgreSQL instance:
+#
+#   airflow  – Airflow's internal metadata store: DAG runs, task instances,
+#              connections, variables, user accounts, scheduler heartbeats.
+#              Owned by the `airflow` user; the pipeline has no access to it.
+#
+#   retail   – The pipeline's application database: retail_transactions and
+#              all analysis output tables written by the Spark jobs and SQL
+#              tasks.  Owned by the `retail` user; Airflow itself never writes
+#              here (only the tasks it orchestrates do).
+#
+# Keeping the two databases separate enforces least-privilege isolation:
+# the `retail` user cannot read Airflow internals, and the `airflow` user
+# cannot access business data.  In production each would typically run on its
+# own database cluster; sharing a single Postgres instance here is a
+# development/demo convenience to keep the Docker Compose stack minimal.
 # =============================================================================
 set -euo pipefail
 

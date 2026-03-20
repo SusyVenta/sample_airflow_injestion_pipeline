@@ -68,6 +68,7 @@ x-airflow-common:
     - ./dags:/opt/airflow/dags                   # DAG definitions
     - ./spark/jobs:/opt/airflow/spark/jobs        # PySpark scripts
     - ./data:/opt/airflow/data                    # Raw CSV input
+    - ./sql:/opt/airflow/sql:ro                  # SQL query files
     - airflow_logs:/opt/airflow/logs
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
@@ -106,6 +107,7 @@ services:
   # --------------------------------------------------------------------------
   spark-master:
     image: apache/spark:3.5.3
+    hostname: spark-master
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
     ports:
       - "7077:7077"   # Spark master RPC port (used by SparkSubmitOperator)
@@ -120,6 +122,7 @@ services:
   # --------------------------------------------------------------------------
   spark-worker:
     image: apache/spark:3.5.3
+    hostname: spark-worker
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
     environment:
       - SPARK_WORKER_MEMORY=2g
@@ -205,7 +208,9 @@ services:
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
     # pytest picks up pythonpath = ["."] from /app/pyproject.toml
-    command: ["python", "-m", "pytest", "-v", "--tb=short"]
+    # Exclude integration tests – those require the full stack and are run
+    # separately via the integration-test profile.
+    command: ["python", "-m", "pytest", "-v", "--tb=short", "--ignore=tests/test_integration.py"]
     profiles:
       - test
 

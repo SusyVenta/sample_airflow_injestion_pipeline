@@ -193,11 +193,21 @@ class TestGetTop10Products:
         )
         result = get_top_10_products(df)
         rows = {r["stock_code"]: r for r in result.collect()}
-        assert rows["X"]["total_quantity"] == 30.0
-        assert rows["Y"]["total_quantity"] == 15.0
+        assert rows["X"]["quantity_sold"] == 30.0
+        assert rows["Y"]["quantity_sold"] == 15.0
         # X has more quantity, so it should be first
         codes = [r["stock_code"] for r in result.collect()]
         assert codes[0] == "X"
+
+    def test_output_columns(self, spark: SparkSession) -> None:
+        """Result must contain exactly stock_code and quantity_sold."""
+        df = _make_cleaned(spark, [{}])
+        result = get_top_10_products(df)
+        assert result.columns == ["stock_code", "quantity_sold"]
+
+    def test_unknown_stock_code_excluded(self, spark: SparkSession) -> None:
+        df = _make_cleaned(spark, [{"stock_code": "UNKNOWN", "quantity": 999.0}])
+        assert get_top_10_products(df).count() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -298,3 +308,16 @@ class TestGetMonthlyRevenueTrend:
         result = get_monthly_revenue_trend(df)
         months = [r["year_month"] for r in result.collect()]
         assert months == sorted(months)
+
+    def test_cancellations_reduce_monthly_revenue(self, spark: SparkSession) -> None:
+        """Cancellations (negative revenue) must be subtracted for net monthly revenue."""
+        df = _make_cleaned(
+            spark,
+            [
+                {"invoice_date": _dt("2011-06-01 10:00:00"), "revenue": 300.0, "is_cancellation": False},
+                {"invoice_date": _dt("2011-06-15 10:00:00"), "revenue": -100.0, "is_cancellation": True},
+            ],
+        )
+        result = get_monthly_revenue_trend(df)
+        assert result.count() == 1
+        assert result.collect()[0]["monthly_revenue"] == 200.0
