@@ -101,11 +101,12 @@ def get_valid_sales(df: DataFrame) -> DataFrame:
 
 def calculate_total_revenue(df: DataFrame) -> float:
     """
-    Return the total net revenue across all valid (non-cancelled) transactions.
+    Return the total net revenue: gross sales minus cancellations/returns.
 
     Revenue is the sum of (Quantity * UnitPrice) rounded to two decimal places.
-    Cancellations are excluded; if you need gross-minus-returns figures, sum
-    all rows including is_cancellation = True.
+    Cancellation rows carry negative revenue and must be included so that
+    reimbursed orders do not inflate the total.  Pass the full (unfiltered)
+    DataFrame to get net revenue; passing only valid sales gives gross revenue.
     """
     result = (
         df.agg(F.round(F.sum("revenue"), 2).alias("total_revenue"))
@@ -294,13 +295,10 @@ def main() -> None:
     valid_df = get_valid_sales(df)
 
     # ------------------------------------------------------------------
-    # 1. Total revenue
+    # 1. Total net revenue (cancellations subtracted)
     # ------------------------------------------------------------------
-    total_revenue = calculate_total_revenue(valid_df)
-    print(
-        f"\n[Analysis 1] Total Revenue (excl. cancellations): "
-        f"GBP {total_revenue:,.2f}"
-    )
+    total_revenue = calculate_total_revenue(df)
+    print(f"\n[Analysis 1] Total Net Revenue: GBP {total_revenue:,.2f}")
 
     # ------------------------------------------------------------------
     # 2. Top 10 products by quantity sold

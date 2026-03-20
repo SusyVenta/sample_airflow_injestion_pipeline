@@ -141,6 +141,17 @@ class TestCalculateTotalRevenue:
         )
         assert calculate_total_revenue(df) == 0.30
 
+    def test_cancellations_reduce_total_revenue(self, spark: SparkSession) -> None:
+        """Negative revenue from cancellations must be subtracted for net total."""
+        df = _make_cleaned(
+            spark,
+            [
+                {"revenue": 500.0, "is_cancellation": False},
+                {"revenue": -100.0, "is_cancellation": True},
+            ],
+        )
+        assert calculate_total_revenue(df) == 400.0
+
 
 # ---------------------------------------------------------------------------
 # get_top_10_products
