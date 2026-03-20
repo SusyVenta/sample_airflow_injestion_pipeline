@@ -175,14 +175,22 @@ def get_monthly_revenue_trend(df: DataFrame) -> DataFrame:
         .orderBy("year_month")
     )
 
-    # Month-over-month growth using a lag window ordered by the month label.
-    # partitionBy(lit(0)) puts all rows in one explicit partition, suppressing
-    # the "No Partition Defined for Window operation" warning that Spark emits
-    # when orderBy is used without partitionBy.
+    # Both MoM and YoY windows use partitionBy(lit(0)) to place all rows in
+    # one explicit global partition ordered by month label.  This makes the
+    # intent clear to Spark and suppresses the "No Partition Defined for Window
+    # operation" warning that would otherwise be emitted.
+    # All windows use partitionBy(lit(0)) to place all rows in one explicit
+    # global partition ordered by month label.  This makes the intent clear to
+    # Spark and suppresses the "No Partition Defined for Window operation"
+    # warning that would otherwise be emitted.
     w = Window.partitionBy(F.lit(0)).orderBy("year_month")
+    w3 = w.rowsBetween(-2, 0)   # 3-month rolling window (current + 2 prior)
+    w6 = w.rowsBetween(-5, 0)   # 6-month rolling window (current + 5 prior)
+
     monthly = (
         monthly
-        .withColumn("prev_revenue", F.lag("monthly_revenue").over(w))
+        # --- Month-over-month growth ---
+        .withColumn("prev_revenue", F.lag("monthly_revenue", 1).over(w))
         .withColumn(
             "mom_growth_pct",
             F.round(
@@ -192,76 +200,159 @@ def get_monthly_revenue_trend(df: DataFrame) -> DataFrame:
             ),
         )
         .drop("prev_revenue")
+        # --- Year-over-year: same month 12 periods back ---
+        # Null for months where fewer than 12 prior months exist in the dataset.
+        .withColumn("prev_year_revenue", F.lag("monthly_revenue", 12).over(w))
+        .withColumn(
+            "yoy_growth_pct",
+            F.round(
+                (F.col("monthly_revenue") - F.col("prev_year_revenue"))
+                / F.col("prev_year_revenue") * 100,
+                2,
+            ),
+        )
+        .drop("prev_year_revenue")
+        # --- Rolling 3-month average (reference baseline displayed in output) ---
+        .withColumn("rolling_3m_avg", F.round(F.avg("monthly_revenue").over(w3), 2))
+        # --- Anomaly indicator 1: revenue level z-score (6-month window) ---
+        # A 6-month window gives a more stable baseline than 3 months.
+        # With 3 months, a single outlier dominates the std and shrinks its
+        # own sigma-distance toward zero (self-normalisation).  With 6 months
+        # the 5 surrounding months anchor the mean and std more reliably.
+        # Threshold: ±1.645σ ≈ p90 two-tailed (flags ~10% of observations).
+        .withColumn("_6m_rev_avg", F.avg("monthly_revenue").over(w6))
+        .withColumn("_6m_rev_std", F.stddev("monthly_revenue").over(w6))
+        .withColumn(
+            "rev_sigma_dist",
+            F.round(
+                (F.col("monthly_revenue") - F.col("_6m_rev_avg"))
+                / F.col("_6m_rev_std"),
+                2,
+            ),
+        )
+        .drop("_6m_rev_avg", "_6m_rev_std")
+        # --- Anomaly indicator 2: MoM growth z-score (6-month window) ---
+        # Measures whether the *rate of change* this month is unusual relative
+        # to recent momentum.  This catches sudden structural breaks (e.g. a
+        # +15 000 % MoM jump or a -70 % collapse) that the revenue-level
+        # indicator may miss when the 6-month std is itself large.
+        .withColumn("_6m_mom_avg", F.avg("mom_growth_pct").over(w6))
+        .withColumn("_6m_mom_std", F.stddev("mom_growth_pct").over(w6))
+        .withColumn(
+            "mom_sigma_dist",
+            F.round(
+                (F.col("mom_growth_pct") - F.col("_6m_mom_avg"))
+                / F.col("_6m_mom_std"),
+                2,
+            ),
+        )
+        .drop("_6m_mom_avg", "_6m_mom_std")
         # Re-apply orderBy: window functions do not preserve the earlier sort
         .orderBy("year_month")
     )
     return monthly
 
 
+_ANOMALY_THRESHOLD: float = 1.645   # ±1.645σ ≈ p90 two-tailed
+
+
 def print_monthly_insights(monthly_df: DataFrame) -> None:
     """
-    Print a human-readable summary with:
-      - Per-month revenue, MoM growth, transaction count
-      - Peak and trough months
-      - Anomaly flags (months more than 2 standard deviations from the mean)
-      - A note on expected seasonal patterns for online retail
+    Print a human-readable summary with two complementary anomaly indicators:
+
+      rev-σ  – 6-month rolling z-score on revenue level.  Catches months
+               where the absolute revenue is far from recent norms.
+      mom-σ  – 6-month rolling z-score on MoM growth rate.  Catches sudden
+               structural breaks (large jumps or collapses) that the revenue-
+               level indicator can miss when the rolling std is itself large.
+
+    Both use ±1.645σ as the flag threshold (≈ p90 two-tailed).  A month
+    flagged by both indicators is a stronger signal than one flagged by either
+    alone.  Flag column shows REV / MOM / BOTH.
     """
     rows = monthly_df.orderBy("year_month").collect()
-    revenues: List[float] = [
-        float(r["monthly_revenue"]) for r in rows if r["monthly_revenue"] is not None
-    ]
 
-    if not revenues:
+    if not rows:
         print("[Analysis 3] No monthly data found.")
         return
 
-    avg_rev = sum(revenues) / len(revenues)
-    variance = sum((r - avg_rev) ** 2 for r in revenues) / len(revenues)
-    std_rev = variance ** 0.5
-
-    print("\n" + "=" * 72)
-    print("  Monthly Revenue Trend")
-    print("=" * 72)
+    w = 130
+    print("\n" + "=" * w)
+    print("  Monthly Net Revenue Trend  (net: gross sales minus cancellations/returns)")
+    print(f"  Anomaly threshold: ±{_ANOMALY_THRESHOLD}σ (p90 two-tailed) on 6-month rolling windows")
+    print("=" * w)
     print(
-        f"  {'Month':<10} {'Revenue (GBP)':>15} {'MoM Growth':>12}"
+        f"  {'Month':<10} {'Revenue (GBP)':>15} {'3m Avg (GBP)':>14}"
+        f" {'MoM':>9} {'YoY':>9}  {'rev-σ(6m)':>10}  {'mom-σ(6m)':>10}  {'Flag':<6}"
         f"  {'Invoices':>8}  {'Customers':>9}"
     )
-    print("-" * 72)
+    print("-" * w)
 
     for row in rows:
         rev = row["monthly_revenue"] or 0.0
-        growth = row["mom_growth_pct"]
-        growth_str = f"{growth:+.1f}%" if growth is not None else "    --"
-        anomaly = " [ANOMALY >2σ]" if abs(rev - avg_rev) > 2 * std_rev else ""
+        avg3 = row["rolling_3m_avg"]
+        mom = row["mom_growth_pct"]
+        yoy = row["yoy_growth_pct"]
+        rev_s = row["rev_sigma_dist"]
+        mom_s = row["mom_sigma_dist"]
+
+        avg3_str = f"{avg3:,.2f}" if avg3 is not None else "            --"
+        mom_str = f"{mom:+.1f}%" if mom is not None else "     --"
+        yoy_str = f"{yoy:+.1f}%" if yoy is not None else "     --"
+        rev_s_str = f"{rev_s:+.2f}σ" if rev_s is not None else "        --"
+        mom_s_str = f"{mom_s:+.2f}σ" if mom_s is not None else "        --"
+
+        rev_flagged = rev_s is not None and abs(rev_s) > _ANOMALY_THRESHOLD
+        mom_flagged = mom_s is not None and abs(mom_s) > _ANOMALY_THRESHOLD
+        if rev_flagged and mom_flagged:
+            flag = "BOTH"
+        elif rev_flagged:
+            flag = "REV"
+        elif mom_flagged:
+            flag = "MOM"
+        else:
+            flag = ""
+
         print(
-            f"  {row['year_month']:<10} {rev:>15,.2f} {growth_str:>12}"
+            f"  {row['year_month']:<10} {rev:>15,.2f} {avg3_str:>14}"
+            f" {mom_str:>9} {yoy_str:>9}  {rev_s_str:>10}  {mom_s_str:>10}  {flag:<6}"
             f"  {row['num_transactions']:>8,}  {row['num_customers']:>9,}"
-            f"{anomaly}"
         )
 
-    print("=" * 72)
+    print("=" * w)
+    print(
+        "  rev-σ(6m): (revenue − 6m rolling avg) / 6m rolling std\n"
+        "  mom-σ(6m): (MoM% − 6m rolling avg MoM%) / 6m rolling std MoM%\n"
+        "  Flag: REV = revenue level outlier | MOM = rate-of-change outlier | BOTH = both"
+    )
 
-    if rows:
-        peak = max(rows, key=lambda r: r["monthly_revenue"] or 0.0)
-        trough = min(rows, key=lambda r: r["monthly_revenue"] or float("inf"))
-        print(
-            f"\n  Peak month  : {peak['year_month']}"
-            f"  (GBP {peak['monthly_revenue']:,.2f})"
-        )
-        print(
-            f"  Trough month: {trough['year_month']}"
-            f"  (GBP {trough['monthly_revenue']:,.2f})"
-        )
+    peak = max(rows, key=lambda r: r["monthly_revenue"] or 0.0)
+    trough = min(rows, key=lambda r: r["monthly_revenue"] or float("inf"))
+    print(
+        f"\n  Peak month  : {peak['year_month']}"
+        f"  (GBP {peak['monthly_revenue']:,.2f})"
+    )
+    print(
+        f"  Trough month: {trough['year_month']}"
+        f"  (GBP {trough['monthly_revenue']:,.2f})"
+    )
 
     print(
         "\n  Interpretation notes:"
-        "\n  - Online retail characteristically peaks in Q4 (Oct–Dec) driven by"
-        "\n    holiday shopping; a spike in November/December is expected."
-        "\n  - Any month flagged [ANOMALY] deviates >2 std deviations from the"
-        "\n    dataset mean and warrants further investigation (e.g. missing data,"
-        "\n    promotional campaigns, or system outages causing under-reporting)."
-        "\n  - Months with unusually low transaction counts relative to revenue"
-        "\n    may indicate bulk/wholesale orders rather than retail sales."
+        "\n  - Revenue is NET (gross sales minus returns). Months with unusually"
+        "\n    high return volumes may show lower or even negative net revenue."
+        "\n  - Two complementary indicators catch different failure modes:"
+        "\n    rev-σ detects sustained level anomalies; mom-σ detects sudden"
+        "\n    structural breaks regardless of absolute revenue level."
+        "\n  - A 6-month window prevents self-normalisation: with a 3-month window"
+        "\n    a single outlier dominates the std and shrinks its own σ-distance"
+        "\n    toward zero. Six months gives 5 anchor points to stabilise the baseline."
+        "\n  - σ values are NULL when fewer data points exist than the window"
+        "\n    needs to compute a meaningful standard deviation."
+        "\n  - Online retail characteristically peaks in Q4 (Oct–Dec). A YoY dip"
+        "\n    in a Q4 month may reflect a partial month at the dataset boundary"
+        "\n    rather than a real decline (e.g. data ending mid-December)."
+        "\n  - YoY '--' means no data exists for the same month one year earlier."
         "\n"
     )
 

@@ -3,4 +3,4 @@
 # and `from tests.conftest import ...` resolve correctly without pip-installing
 # the package first.
 pythonpath = ["."]
-testpaths  = ["tests"]
+testpaths  = ["tests/unit", "tests/integration"]

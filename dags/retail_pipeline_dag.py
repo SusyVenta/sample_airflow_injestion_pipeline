@@ -36,6 +36,7 @@ Connections expected in Airflow (set via env vars in docker-compose):
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -68,13 +69,24 @@ _SAMPLE_ROWS: int = 10
 _LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Email notifications
+# ---------------------------------------------------------------------------
+# ALERT_EMAIL is read from the environment (set in docker-compose.yml).
+# When non-empty Airflow will email this address on every task failure,
+# using the AIRFLOW__SMTP__* settings also defined in docker-compose.yml.
+# Set ALERT_EMAIL="" in docker-compose.yml to disable notifications.
+_ALERT_EMAIL: str = os.getenv("ALERT_EMAIL", "")
+
+# ---------------------------------------------------------------------------
 # Default task arguments
 # ---------------------------------------------------------------------------
 DEFAULT_ARGS = {
     "owner": "data_engineering",
     "depends_on_past": False,
-    "email_on_failure": False,
+    # Send an email on task failure if ALERT_EMAIL is configured.
+    "email_on_failure": bool(_ALERT_EMAIL),
     "email_on_retry": False,
+    "email": [_ALERT_EMAIL] if _ALERT_EMAIL else [],
     # Retry twice with a 5-minute back-off before marking the task failed
     "retries": 2,
     "retry_delay": timedelta(minutes=5),

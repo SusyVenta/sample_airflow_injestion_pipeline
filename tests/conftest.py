@@ -10,7 +10,11 @@ plain Python lists, so no external services (PostgreSQL, HDFS) are needed.
 
 from __future__ import annotations
 
+import os
+import smtplib
+import socket
 from datetime import datetime
+from email.message import EmailMessage
 from typing import List
 
 import pytest
@@ -23,6 +27,60 @@ from pyspark.sql.types import (
     StructType,
     TimestampType,
 )
+
+
+# ---------------------------------------------------------------------------
+# Email notification on test failure
+# ---------------------------------------------------------------------------
+# Reads the same SMTP env vars used by Airflow (set in docker-compose.yml).
+# Silently skips if ALERT_EMAIL or SMTP credentials are not configured.
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Send an email alert when any test fails.
+
+    Triggered automatically by pytest after the full test session finishes.
+    No-ops when ALERT_EMAIL is unset or SMTP credentials are missing,
+    so removing the env vars is sufficient to disable notifications.
+    """
+    if exitstatus == 0:
+        return  # all tests passed — nothing to report
+
+    alert_email = os.getenv("ALERT_EMAIL", "")
+    smtp_host = os.getenv("AIRFLOW__SMTP__SMTP_HOST", "")
+    smtp_port = int(os.getenv("AIRFLOW__SMTP__SMTP_PORT", "587"))
+    smtp_user = os.getenv("AIRFLOW__SMTP__SMTP_USER", "")
+    smtp_password = os.getenv("AIRFLOW__SMTP__SMTP_PASSWORD", "")
+    smtp_from = os.getenv("AIRFLOW__SMTP__SMTP_MAIL_FROM", smtp_user)
+    use_tls = os.getenv("AIRFLOW__SMTP__SMTP_STARTTLS", "true").lower() == "true"
+
+    if not all([alert_email, smtp_host, smtp_user, smtp_password]):
+        return  # notifications not configured — skip silently
+
+    failed = getattr(session, "testsfailed", 0)
+    host = socket.gethostname()
+
+    msg = EmailMessage()
+    msg["Subject"] = f"[TEST FAILURE] {failed} test(s) failed on {host}"
+    msg["From"] = smtp_from
+    msg["To"] = alert_email
+    msg.set_content(
+        f"{failed} test(s) failed during the pytest session on host '{host}'.\n\n"
+        f"Exit status: {exitstatus}\n"
+        f"Total collected: {session.testscollected}\n\n"
+        f"Check the container logs for the full traceback:\n"
+        f"  docker compose logs tests\n"
+        f"  docker compose logs integration-tests\n"
+    )
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            if use_tls:
+                server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+    except Exception:
+        pass  # never let a notification failure break the test exit code
 
 
 # ---------------------------------------------------------------------------

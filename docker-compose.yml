@@ -64,6 +64,19 @@ x-airflow-common:
     POSTGRES_USER: retail
     POSTGRES_PASSWORD: retail
 
+    # --------------- Email notifications (optional) ---------------------------
+    # Fill in your SMTP credentials to enable failure alerts for DAG tasks.
+    # Set ALERT_EMAIL to "" (empty string) to disable all email notifications.
+    # See README.md § "Email notifications" for full setup instructions.
+    AIRFLOW__SMTP__SMTP_HOST: "smtp.example.com"       # e.g. smtp.gmail.com
+    AIRFLOW__SMTP__SMTP_PORT: "587"
+    AIRFLOW__SMTP__SMTP_STARTTLS: "true"
+    AIRFLOW__SMTP__SMTP_SSL: "false"
+    AIRFLOW__SMTP__SMTP_USER: "sender@example.com"
+    AIRFLOW__SMTP__SMTP_PASSWORD: ""                   # SMTP password or app-specific password
+    AIRFLOW__SMTP__SMTP_MAIL_FROM: "sender@example.com"
+    ALERT_EMAIL: "alerts@example.com"                  # recipient; set to "" to disable
+
   volumes:
     - ./dags:/opt/airflow/dags                   # DAG definitions
     - ./spark/jobs:/opt/airflow/spark/jobs        # PySpark scripts
@@ -207,10 +220,17 @@ services:
       - .:/app                   # entire project root mounted at /app
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
-    # pytest picks up pythonpath = ["."] from /app/pyproject.toml
-    # Exclude integration tests – those require the full stack and are run
-    # separately via the integration-test profile.
-    command: ["python", "-m", "pytest", "-v", "--tb=short", "--ignore=tests/test_integration.py"]
+      # Email notification settings — mirror values from x-airflow-common-env.
+      # Set ALERT_EMAIL to "" to disable test-failure notifications.
+      AIRFLOW__SMTP__SMTP_HOST: "smtp.example.com"
+      AIRFLOW__SMTP__SMTP_PORT: "587"
+      AIRFLOW__SMTP__SMTP_STARTTLS: "true"
+      AIRFLOW__SMTP__SMTP_USER: "sender@example.com"
+      AIRFLOW__SMTP__SMTP_PASSWORD: ""
+      AIRFLOW__SMTP__SMTP_MAIL_FROM: "sender@example.com"
+      ALERT_EMAIL: "alerts@example.com"
+    # pytest picks up pythonpath = ["."] and testpaths from /app/pyproject.toml
+    command: ["python", "-m", "pytest", "tests/unit", "-v", "--tb=short"]
     profiles:
       - test
 
@@ -231,6 +251,14 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
       AIRFLOW_BASE_URL: "http://airflow-webserver:8080"
       POSTGRES_HOST: postgres
+      # Email notification settings — mirror values from x-airflow-common-env.
+      AIRFLOW__SMTP__SMTP_HOST: "smtp.example.com"
+      AIRFLOW__SMTP__SMTP_PORT: "587"
+      AIRFLOW__SMTP__SMTP_STARTTLS: "true"
+      AIRFLOW__SMTP__SMTP_USER: "sender@example.com"
+      AIRFLOW__SMTP__SMTP_PASSWORD: ""
+      AIRFLOW__SMTP__SMTP_MAIL_FROM: "sender@example.com"
+      ALERT_EMAIL: "alerts@example.com"
       POSTGRES_PORT: "5432"
       POSTGRES_DB: retail
       POSTGRES_USER: retail
@@ -242,7 +270,7 @@ services:
         condition: service_healthy
       airflow-scheduler:
         condition: service_healthy
-    command: ["python", "-m", "pytest", "tests/test_integration.py", "-v", "--tb=short", "-s"]
+    command: ["python", "-m", "pytest", "tests/integration", "-v", "--tb=short", "-s"]
     profiles:
       - integration-test
 

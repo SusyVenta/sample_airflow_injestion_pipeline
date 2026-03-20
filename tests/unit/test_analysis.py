@@ -332,3 +332,83 @@ class TestGetMonthlyRevenueTrend:
         result = get_monthly_revenue_trend(df)
         assert result.count() == 1
         assert result.collect()[0]["monthly_revenue"] == 200.0
+
+    def test_yoy_growth_calculated_correctly(self, spark: SparkSession) -> None:
+        """yoy_growth_pct compares each month to the same month 12 periods earlier."""
+        # 13 months: Jan 2010 … Jan 2011. Only Jan 2011 has a valid YoY comparison.
+        rows_data = []
+        for month in range(1, 13):  # Jan–Dec 2010
+            rows_data.append({
+                "invoice_date": _dt(f"2010-{month:02d}-01 10:00:00"),
+                "revenue": 100.0,
+            })
+        rows_data.append({  # Jan 2011: 150 vs Jan 2010: 100 → +50%
+            "invoice_date": _dt("2011-01-01 10:00:00"),
+            "revenue": 150.0,
+        })
+        df = _make_cleaned(spark, rows_data)
+        result = get_monthly_revenue_trend(df).orderBy("year_month")
+        by_month = {r["year_month"]: r for r in result.collect()}
+        # All 2010 months: no prior-year data → null
+        for m in range(1, 13):
+            assert by_month[f"2010-{m:02d}"]["yoy_growth_pct"] is None
+        # Jan 2011: (150 - 100) / 100 * 100 = +50.0%
+        assert by_month["2011-01"]["yoy_growth_pct"] == 50.0
+
+    def test_rolling_3m_avg_single_month(self, spark: SparkSession) -> None:
+        """First month: 3m rolling avg equals its own revenue; sigma dists are null."""
+        df = _make_cleaned(spark, [{"invoice_date": _dt("2011-01-01 10:00:00"), "revenue": 100.0}])
+        row = get_monthly_revenue_trend(df).collect()[0]
+        assert row["rolling_3m_avg"] == 100.0
+        assert row["rev_sigma_dist"] is None   # std undefined for n=1
+        assert row["mom_sigma_dist"] is None   # MoM is null for the first month
+
+    def test_rolling_3m_avg_three_months(self, spark: SparkSession) -> None:
+        """After three months the 3m avg covers all three rows."""
+        df = _make_cleaned(
+            spark,
+            [
+                {"invoice_date": _dt("2011-01-01 10:00:00"), "revenue": 100.0},
+                {"invoice_date": _dt("2011-02-01 10:00:00"), "revenue": 200.0},
+                {"invoice_date": _dt("2011-03-01 10:00:00"), "revenue": 300.0},
+            ],
+        )
+        rows = get_monthly_revenue_trend(df).orderBy("year_month").collect()
+        # Third month 3m avg: avg(100, 200, 300) = 200
+        assert rows[2]["rolling_3m_avg"] == 200.0
+        # Third month rev_sigma (6m window = same 3 rows here):
+        # avg=200, std=100, sigma=(300-200)/100 = 1.0
+        assert rows[2]["rev_sigma_dist"] == 1.0
+
+    def test_rolling_3m_window_slides(self, spark: SparkSession) -> None:
+        """Fourth month's 3m avg covers only months 2-4, not month 1."""
+        df = _make_cleaned(
+            spark,
+            [
+                {"invoice_date": _dt("2011-01-01 10:00:00"), "revenue": 100.0},
+                {"invoice_date": _dt("2011-02-01 10:00:00"), "revenue": 200.0},
+                {"invoice_date": _dt("2011-03-01 10:00:00"), "revenue": 300.0},
+                {"invoice_date": _dt("2011-04-01 10:00:00"), "revenue": 400.0},
+            ],
+        )
+        rows = get_monthly_revenue_trend(df).orderBy("year_month").collect()
+        # Fourth month 3m window: [200, 300, 400]; avg = 300
+        assert rows[3]["rolling_3m_avg"] == 300.0
+
+    def test_mom_sigma_flags_sudden_jump(self, spark: SparkSession) -> None:
+        """mom_sigma_dist should be large when one month has an extreme MoM jump."""
+        df = _make_cleaned(
+            spark,
+            [
+                {"invoice_date": _dt("2011-01-01 10:00:00"), "revenue": 100.0},
+                {"invoice_date": _dt("2011-02-01 10:00:00"), "revenue": 110.0},
+                {"invoice_date": _dt("2011-03-01 10:00:00"), "revenue": 105.0},
+                {"invoice_date": _dt("2011-04-01 10:00:00"), "revenue": 108.0},
+                {"invoice_date": _dt("2011-05-01 10:00:00"), "revenue": 112.0},
+                {"invoice_date": _dt("2011-06-01 10:00:00"), "revenue": 10000.0},
+            ],
+        )
+        rows = get_monthly_revenue_trend(df).orderBy("year_month").collect()
+        # June MoM is extreme; mom_sigma_dist should flag it (> 1.645)
+        assert rows[5]["mom_sigma_dist"] is not None
+        assert rows[5]["mom_sigma_dist"] > 1.645

@@ -1,6 +1,6 @@
 # Online Retail Data Pipeline
 
-End-to-end data pipeline using **Apache Spark**, **Apache Airflow**, and **PostgreSQL**, orchestrated with Docker Compose.
+End-to-end data pipeline using **Apache Spark**, **Apache Airflow**, and **PostgreSQL**, orchestrated with Docker Compose. Implements requirements specified in 'Pipeline_requirements.pdf'.
 
 ---
 
@@ -23,9 +23,12 @@ End-to-end data pipeline using **Apache Spark**, **Apache Airflow**, and **Postg
 │   ├── top_3_products_last_6m.sql      # SQL: top-3 products by revenue per month (last 6 months)
 │   ├── rolling_3m_avg_australia.sql    # SQL: rolling 3-month average revenue for Australia
 ├── tests/
-│   ├── conftest.py                 # Shared SparkSession fixture + helpers
-│   ├── test_cleaning.py            # Unit tests for cleaning functions
-│   └── test_analysis.py            # Unit tests for analysis functions
+│   ├── conftest.py                 # Shared SparkSession fixture + email notification hook
+│   ├── unit/
+│   │   ├── test_cleaning.py        # Unit tests for cleaning functions
+│   │   └── test_analysis.py        # Unit tests for analysis functions
+│   └── integration/
+│       └── test_integration.py     # End-to-end DAG tests (requires full stack)
 ├── docker-compose.yml              # Postgres 15, Spark 3.5 master+worker, custom Airflow (webserver + scheduler + init)
 └── README.md
 ```
@@ -140,7 +143,7 @@ SELECT COUNT(*), COUNT(DISTINCT invoice_no), MIN(invoice_date), MAX(invoice_date
 FROM retail_transactions;
 
 -- Top 10 products saved by PySpark analysis job
-SELECT * FROM analysis_top10_products ORDER BY total_quantity DESC;
+SELECT * FROM analysis_top10_products ORDER BY quantity_sold DESC;
 
 -- Monthly revenue trend
 SELECT * FROM analysis_monthly_revenue ORDER BY year_month;
@@ -154,12 +157,18 @@ SELECT * FROM analysis_monthly_revenue ORDER BY year_month;
 ## 9 — Run SQL analysis queries manually
 
 ```bash
+# Top 3 products by revenue per month (last 6 months)
 docker compose exec postgres \
     psql -U retail -d retail \
-    -f /docker-entrypoint-initdb.d/../sql/analysis.sql
+    -f /opt/airflow/sql/top_3_products_last_6m.sql
+
+# Rolling 3-month average revenue for Australia
+docker compose exec postgres \
+    psql -U retail -d retail \
+    -f /opt/airflow/sql/rolling_3m_avg_australia.sql
 ```
 
-Or copy-paste from [sql/analysis.sql](sql/analysis.sql) into any PostgreSQL client connected to the `retail` database.
+Or copy-paste from [sql/top_3_products_last_6m.sql](sql/top_3_products_last_6m.sql) and [sql/rolling_3m_avg_australia.sql](sql/rolling_3m_avg_australia.sql) into any PostgreSQL client connected to the `retail` database.
 
 ---
 
@@ -183,7 +192,7 @@ docker compose --profile test run --rm tests
 Expected output ends with something like:
 
 ```
-============================== 56 passed in 8.62s ==============================
+============================== 65 passed in 10.xx s ==============================
 ```
 
 **Run with coverage report:**
@@ -199,11 +208,11 @@ docker compose --profile test run --rm tests \
 ```bash
 # Single file
 docker compose --profile test run --rm tests \
-    python -m pytest tests/test_cleaning.py -v
+    python -m pytest tests/unit/test_cleaning.py -v
 
 # Single test class
 docker compose --profile test run --rm tests \
-    python -m pytest tests/test_cleaning.py::TestCleanDataIntegration -v
+    python -m pytest tests/unit/test_cleaning.py::TestCleanDataIntegration -v
 ```
 
 The tests run PySpark in **local mode** — no Spark cluster or PostgreSQL
@@ -231,8 +240,53 @@ The test runner:
 Expected output ends with:
 
 ```
-============================== 16 passed in XX.XXs ==============================
+============================== 15 passed in XX.XXs ==============================
 ```
+
+---
+
+## Email notifications
+
+The pipeline and test runner can send email alerts on failure. Notifications are **disabled by default** — set `ALERT_EMAIL` to a non-empty address to enable them.
+
+### Where to configure
+
+All SMTP settings live in **`docker-compose.yml`** under the `x-airflow-common` block (for DAG task alerts) and mirrored in the `tests` / `integration-tests` service blocks (for test-runner alerts):
+
+```yaml
+AIRFLOW__SMTP__SMTP_HOST: "smtp.example.com"   # ← your SMTP server
+AIRFLOW__SMTP__SMTP_PORT: "587"
+AIRFLOW__SMTP__SMTP_STARTTLS: "true"
+AIRFLOW__SMTP__SMTP_SSL: "false"
+AIRFLOW__SMTP__SMTP_USER: "sender@example.com" # ← sending address
+AIRFLOW__SMTP__SMTP_PASSWORD: ""               # ← SMTP password or app password
+AIRFLOW__SMTP__SMTP_MAIL_FROM: "sender@example.com"
+ALERT_EMAIL: "alerts@example.com"             # ← recipient; set "" to disable
+```
+
+### What triggers a notification
+
+| Event | Mechanism |
+|-------|-----------|
+| Any Airflow task fails (after all retries) | Airflow built-in `email_on_failure` — reads `AIRFLOW__SMTP__*` + `ALERT_EMAIL` |
+| Any unit or integration test fails | `pytest_sessionfinish` hook in `tests/conftest.py` — reads the same env vars |
+
+### Gmail example
+
+1. Enable **2-Step Verification** on your Google account.
+2. Generate an **App Password** (Google Account → Security → App Passwords).
+3. In `docker-compose.yml` set:
+   ```yaml
+   AIRFLOW__SMTP__SMTP_HOST: "smtp.gmail.com"
+   AIRFLOW__SMTP__SMTP_USER: "you@gmail.com"
+   AIRFLOW__SMTP__SMTP_PASSWORD: "your-16-char-app-password"
+   AIRFLOW__SMTP__SMTP_MAIL_FROM: "you@gmail.com"
+   ALERT_EMAIL: "alerts@yourteam.com"
+   ```
+4. Restart the stack: `docker compose up -d airflow-webserver airflow-scheduler`
+
+> **Security note:** avoid committing real SMTP credentials to version control.
+> Use a `.env` file (listed in `.gitignore`) or a secrets manager in production.
 
 ---
 
@@ -279,8 +333,8 @@ ingest_and_clean  ──► run_pyspark_analysis
 |------|------|-------------|
 | `ingest_and_clean` | SparkSubmitOperator | Reads CSV, cleans data, anonymises CustomerID (PII), writes to `retail_transactions` |
 | `run_pyspark_analysis` | SparkSubmitOperator | Reads from PostgreSQL; computes total revenue, top-10 products, monthly trend |
-| `sql_top_3_products_last_6m` | PostgresOperator | Window function: top 3 products by revenue per month (last 6 months of data) |
-| `sql_rolling_3m_avg_australia` | PostgresOperator | Rolling 3-month average revenue for Australia |
+| `sql_top_3_products_last_6m` | PythonOperator | Top 3 products by revenue per month (last 6 months); reads SQL file, executes once, logs results |
+| `sql_rolling_3m_avg_australia` | PythonOperator | Rolling 3-month average revenue for Australia; reads SQL file, executes once, logs results |
 
 ---
 
@@ -307,6 +361,9 @@ ingest_and_clean  ──► run_pyspark_analysis
 ## Environment variables reference
 
 All variables have defaults that work out of the box with docker-compose.
+Edit `docker-compose.yml` to change any value.
+
+### Pipeline
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -316,3 +373,16 @@ All variables have defaults that work out of the box with docker-compose.
 | `POSTGRES_DB` | `retail` | Retail database name |
 | `POSTGRES_USER` | `retail` | Retail database user |
 | `POSTGRES_PASSWORD` | `retail` | Retail database password |
+
+### Email notifications
+
+| Variable | Placeholder | Description |
+|----------|-------------|-------------|
+| `ALERT_EMAIL` | `alerts@example.com` | Failure alert recipient. Set to `""` to disable all notifications |
+| `AIRFLOW__SMTP__SMTP_HOST` | `smtp.example.com` | SMTP server hostname |
+| `AIRFLOW__SMTP__SMTP_PORT` | `587` | SMTP port (587 = STARTTLS, 465 = SSL) |
+| `AIRFLOW__SMTP__SMTP_STARTTLS` | `true` | Use STARTTLS (`true`/`false`) |
+| `AIRFLOW__SMTP__SMTP_SSL` | `false` | Use implicit SSL — set to `true` and port `465` for SSL-only servers |
+| `AIRFLOW__SMTP__SMTP_USER` | `sender@example.com` | SMTP login username |
+| `AIRFLOW__SMTP__SMTP_PASSWORD` | _(empty)_ | SMTP password or app-specific password |
+| `AIRFLOW__SMTP__SMTP_MAIL_FROM` | `sender@example.com` | From address shown in alert emails |
