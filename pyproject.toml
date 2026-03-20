@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Add the project root to sys.path so that `from spark.jobs.xxx import ...`
+# and `from tests.conftest import ...` resolve correctly without pip-installing
+# the package first.
+pythonpath = ["."]
+testpaths  = ["tests"]
