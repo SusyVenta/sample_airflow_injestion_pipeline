@@ -22,14 +22,22 @@
 --      also included.
 -- =============================================================================
 
-WITH dataset_max_date AS (
+-- retail_transactions uses Type 2 append: every pipeline run adds rows tagged
+-- with loaded_at.  The latest_batch CTE scopes all subsequent CTEs to a single
+-- consistent snapshot so aggregations are not inflated by prior runs.
+WITH latest_batch AS (
+    SELECT * FROM retail_transactions
+    WHERE  loaded_at = (SELECT MAX(loaded_at) FROM retail_transactions)
+),
+
+dataset_max_date AS (
     -- Truncate to month so the 6-month window aligns on calendar-month
     -- boundaries.  Without truncation MAX(invoice_date) is a mid-month
     -- timestamp, and subtracting 6 months would cut off the partial first
     -- month.  Note: QUALIFY (BigQuery/Snowflake/DuckDB) is not available in
     -- PostgreSQL, so the revenue_rank filter is applied via a subquery below.
     SELECT DATE_TRUNC('month', MAX(invoice_date))::DATE AS max_month
-    FROM   retail_transactions
+    FROM   latest_batch
 ),
 
 monthly_product_revenue AS (
@@ -38,7 +46,7 @@ monthly_product_revenue AS (
         stock_code,
         description,
         SUM(revenue)                             AS total_revenue
-    FROM   retail_transactions
+    FROM   latest_batch
     WHERE  DATE_TRUNC('month', invoice_date) BETWEEN
                (SELECT max_month - INTERVAL '6 months' FROM dataset_max_date)
            AND (SELECT max_month                        FROM dataset_max_date)

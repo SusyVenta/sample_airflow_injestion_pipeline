@@ -12,13 +12,16 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime
+from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.types import StringType
 
 from tests.conftest import make_raw_rows
 
 # Import functions under test
 from spark.jobs.clean_and_ingest import (
+    RETAIL_CSV_SCHEMA,
     anonymise_customer_id,
     cast_types,
     clean_data,
@@ -26,6 +29,7 @@ from spark.jobs.clean_and_ingest import (
     drop_invalid_rows,
     fill_missing_country,
     flag_cancellations,
+    load_raw_data,
     recalculate_revenue,
     rename_to_snake_case,
 )
@@ -307,3 +311,83 @@ class TestCleanDataIntegration:
         )
         result = clean_data(df)
         assert _collect_col(result, "revenue") == [30.0]
+
+
+# ---------------------------------------------------------------------------
+# load_raw_data
+# ---------------------------------------------------------------------------
+
+# Minimal CSV that exercises both schema modes.
+_CSV_CONTENT = (
+    "InvoiceNo,StockCode,Description,Quantity,InvoiceDate,"
+    "UnitPrice,CustomerID,Country,Revenue\n"
+    "536365,85123A,WHITE HANGING HEART T-LIGHT HOLDER,"
+    "6,12/1/2010 8:26,2.55,17850,United Kingdom,15.3\n"
+    "536366,71053,WHITE METAL LANTERN,"
+    "6,12/1/2010 8:26,3.39,,France,20.34\n"
+)
+
+
+class TestLoadRawData:
+    def _csv(self, tmp_path: Path) -> str:
+        p = tmp_path / "retail.csv"
+        p.write_text(_CSV_CONTENT)
+        return str(p)
+
+    def test_enforce_schema_loads_all_rows(
+        self, spark: SparkSession, tmp_path: Path
+    ) -> None:
+        df = load_raw_data(spark, self._csv(tmp_path), enforce_schema=True)
+        assert df.count() == 2
+
+    def test_infer_schema_loads_all_rows(
+        self, spark: SparkSession, tmp_path: Path
+    ) -> None:
+        df = load_raw_data(spark, self._csv(tmp_path), enforce_schema=False)
+        assert df.count() == 2
+
+    def test_enforce_schema_is_default(
+        self, spark: SparkSession, tmp_path: Path
+    ) -> None:
+        """Calling load_raw_data with no keyword must behave like enforce_schema=True."""
+        path = self._csv(tmp_path)
+        assert load_raw_data(spark, path).schema == load_raw_data(
+            spark, path, enforce_schema=True
+        ).schema
+
+    def test_enforce_schema_matches_retail_csv_schema(
+        self, spark: SparkSession, tmp_path: Path
+    ) -> None:
+        df = load_raw_data(spark, self._csv(tmp_path), enforce_schema=True)
+        assert df.schema == RETAIL_CSV_SCHEMA
+
+    def test_enforce_schema_customer_id_is_string(
+        self, spark: SparkSession, tmp_path: Path
+    ) -> None:
+        """With enforced schema CustomerID is StringType — no .0 float artifact."""
+        df = load_raw_data(spark, self._csv(tmp_path), enforce_schema=True)
+        assert df.schema["CustomerID"].dataType == StringType()
+
+    def test_enforce_schema_customer_id_no_float_suffix(
+        self, spark: SparkSession, tmp_path: Path
+    ) -> None:
+        """CustomerID '17850' must arrive as '17850', not '17850.0'."""
+        df = load_raw_data(spark, self._csv(tmp_path), enforce_schema=True)
+        ids = [r["CustomerID"] for r in df.collect() if r["CustomerID"] is not None]
+        assert all("." not in cid for cid in ids)
+
+    def test_enforce_schema_invoice_date_is_string(
+        self, spark: SparkSession, tmp_path: Path
+    ) -> None:
+        """InvoiceDate is loaded as StringType so cast_types() can handle the format."""
+        df = load_raw_data(spark, self._csv(tmp_path), enforce_schema=True)
+        assert df.schema["InvoiceDate"].dataType == StringType()
+
+    def test_enforce_schema_null_customer_id_preserved(
+        self, spark: SparkSession, tmp_path: Path
+    ) -> None:
+        """Rows with an empty CustomerID column must yield NULL, not an empty string."""
+        df = load_raw_data(spark, self._csv(tmp_path), enforce_schema=True)
+        # Second row has no CustomerID in the test CSV
+        null_count = df.filter(df["CustomerID"].isNull()).count()
+        assert null_count == 1

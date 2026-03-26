@@ -21,11 +21,19 @@
 --   no early or late transactions, potentially hiding leading/trailing gaps.
 -- =============================================================================
 
-WITH monthly_australia AS (
+-- retail_transactions uses Type 2 append: every pipeline run adds rows tagged
+-- with loaded_at.  The latest_batch CTE scopes all subsequent CTEs to a single
+-- consistent snapshot so aggregations are not inflated by prior runs.
+WITH latest_batch AS (
+    SELECT * FROM retail_transactions
+    WHERE  loaded_at = (SELECT MAX(loaded_at) FROM retail_transactions)
+),
+
+monthly_australia AS (
     SELECT
         DATE_TRUNC('month', invoice_date)::DATE  AS month,
         SUM(revenue)                             AS monthly_revenue
-    FROM   retail_transactions
+    FROM   latest_batch
     WHERE  country          = 'Australia'
       AND  is_cancellation  = FALSE
       AND  revenue          > 0
@@ -39,7 +47,7 @@ all_months AS (
                DATE_TRUNC('month', MAX(invoice_date))::DATE,
                INTERVAL '1 month'
            )::DATE AS month
-    FROM   retail_transactions
+    FROM   latest_batch
 )
 
 SELECT

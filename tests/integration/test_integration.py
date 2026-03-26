@@ -228,15 +228,25 @@ class TestRetailTransactions:
         assert cancellations > 0
 
     def test_no_duplicate_rows(self, dag_run_id):
-        total = _pg_scalar("SELECT COUNT(*) FROM retail_transactions")
-        distinct = _pg_scalar(
-            "SELECT COUNT(*) FROM ("
-            "  SELECT DISTINCT invoice_no, stock_code, quantity, invoice_date, "
-            "                  unit_price, customer_id, country "
-            "  FROM retail_transactions"
-            ") t"
+        """Within the latest loaded batch there must be no duplicate business-key rows."""
+        latest = "(SELECT MAX(loaded_at) FROM retail_transactions)"
+        total = _pg_scalar(
+            f"SELECT COUNT(*) FROM retail_transactions WHERE loaded_at = {latest}"
         )
-        assert total == distinct, "Duplicate rows found in retail_transactions"
+        distinct = _pg_scalar(
+            f"SELECT COUNT(*) FROM ("
+            f"  SELECT DISTINCT invoice_no, stock_code, quantity, invoice_date,"
+            f"                  unit_price, customer_id, country"
+            f"  FROM retail_transactions WHERE loaded_at = {latest}"
+            f") t"
+        )
+        assert total == distinct, "Duplicate rows found in the latest retail_transactions batch"
+
+    def test_loaded_at_column_populated(self, dag_run_id):
+        null_count = _pg_scalar(
+            "SELECT COUNT(*) FROM retail_transactions WHERE loaded_at IS NULL"
+        )
+        assert null_count == 0
 
 
 class TestAnalysisTop10Products:
@@ -247,7 +257,10 @@ class TestAnalysisTop10Products:
         assert count > 0
 
     def test_at_most_10_rows(self, dag_run_id):
-        count = _pg_scalar("SELECT COUNT(*) FROM analysis_top10_products")
+        latest = "(SELECT MAX(loaded_at) FROM analysis_top10_products)"
+        count = _pg_scalar(
+            f"SELECT COUNT(*) FROM analysis_top10_products WHERE loaded_at = {latest}"
+        )
         assert count <= 10
 
     def test_quantities_are_positive(self, dag_run_id):
@@ -255,6 +268,12 @@ class TestAnalysisTop10Products:
             "SELECT COUNT(*) FROM analysis_top10_products WHERE quantity_sold <= 0"
         )
         assert bad == 0
+
+    def test_loaded_at_column_populated(self, dag_run_id):
+        null_count = _pg_scalar(
+            "SELECT COUNT(*) FROM analysis_top10_products WHERE loaded_at IS NULL"
+        )
+        assert null_count == 0
 
 
 class TestAnalysisMonthlyRevenue:
@@ -277,10 +296,127 @@ class TestAnalysisMonthlyRevenue:
         assert months == sorted(months)
 
     def test_first_month_has_null_mom_growth(self, dag_run_id):
-        """The earliest month has no prior month, so mom_growth_pct must be NULL."""
+        """The earliest month in the latest batch has no prior month → mom_growth_pct NULL."""
+        latest = "(SELECT MAX(loaded_at) FROM analysis_monthly_revenue)"
         null_count = _pg_scalar(
-            "SELECT COUNT(*) FROM analysis_monthly_revenue "
-            "WHERE year_month = (SELECT MIN(year_month) FROM analysis_monthly_revenue) "
-            "  AND mom_growth_pct IS NULL"
+            f"SELECT COUNT(*) FROM analysis_monthly_revenue "
+            f"WHERE loaded_at = {latest} "
+            f"  AND year_month = ("
+            f"    SELECT MIN(year_month) FROM analysis_monthly_revenue"
+            f"    WHERE loaded_at = {latest}"
+            f"  ) "
+            f"  AND mom_growth_pct IS NULL"
         )
         assert null_count == 1
+
+    def test_loaded_at_column_populated(self, dag_run_id):
+        null_count = _pg_scalar(
+            "SELECT COUNT(*) FROM analysis_monthly_revenue WHERE loaded_at IS NULL"
+        )
+        assert null_count == 0
+
+
+class TestSqlTop3ProductsLast6m:
+    """Verifies the sql_top_3_products_last_6m table persisted by the SQL task."""
+
+    def test_table_has_rows(self, dag_run_id):
+        count = _pg_scalar('SELECT COUNT(*) FROM sql_top_3_products_last_6m')
+        assert count > 0, "sql_top_3_products_last_6m is empty"
+
+    def test_rank_values_are_1_to_3(self, dag_run_id):
+        """revenue_rank is BIGINT (from DENSE_RANK()); all values must be 1, 2, or 3."""
+        bad = _pg_scalar(
+            "SELECT COUNT(*) FROM sql_top_3_products_last_6m "
+            "WHERE revenue_rank NOT IN (1, 2, 3)"
+        )
+        assert bad == 0, "Unexpected revenue_rank values outside 1–3"
+
+    def test_month_format_is_yyyy_mm(self, dag_run_id):
+        """Every month value must match the YYYY-MM pattern."""
+        bad = _pg_scalar(
+            "SELECT COUNT(*) FROM sql_top_3_products_last_6m "
+            "WHERE month !~ '^[0-9]{4}-[0-9]{2}$'"
+        )
+        assert bad == 0, "month column contains values not in YYYY-MM format"
+
+    def test_no_null_months(self, dag_run_id):
+        bad = _pg_scalar(
+            "SELECT COUNT(*) FROM sql_top_3_products_last_6m WHERE month IS NULL"
+        )
+        assert bad == 0
+
+    def test_expected_columns_present(self, dag_run_id):
+        """Table must contain the five result columns plus the loaded_at audit column."""
+        cols = _pg_col(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'sql_top_3_products_last_6m' "
+            "ORDER BY ordinal_position"
+        )
+        assert set(cols) == {
+            "month", "stock_code", "description",
+            "total_revenue_gbp", "revenue_rank", "loaded_at",
+        }
+
+    def test_loaded_at_column_populated(self, dag_run_id):
+        null_count = _pg_scalar(
+            "SELECT COUNT(*) FROM sql_top_3_products_last_6m WHERE loaded_at IS NULL"
+        )
+        assert null_count == 0
+
+
+class TestSqlRolling3mAvgAustralia:
+    """Verifies the sql_rolling_3m_avg_australia table persisted by the SQL task."""
+
+    def test_table_has_rows(self, dag_run_id):
+        count = _pg_scalar('SELECT COUNT(*) FROM sql_rolling_3m_avg_australia')
+        assert count > 0, "sql_rolling_3m_avg_australia is empty"
+
+    def test_month_format_is_yyyy_mm(self, dag_run_id):
+        """Every month value must match the YYYY-MM pattern."""
+        bad = _pg_scalar(
+            "SELECT COUNT(*) FROM sql_rolling_3m_avg_australia "
+            "WHERE month !~ '^[0-9]{4}-[0-9]{2}$'"
+        )
+        assert bad == 0, "month column contains values not in YYYY-MM format"
+
+    def test_months_are_ordered(self, dag_run_id):
+        """Months must appear in ascending chronological order."""
+        months = _pg_col(
+            "SELECT month FROM sql_rolling_3m_avg_australia ORDER BY month"
+        )
+        assert months == sorted(months)
+
+    def test_expected_columns_present(self, dag_run_id):
+        """Table must contain the three result columns plus the loaded_at audit column."""
+        cols = _pg_col(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'sql_rolling_3m_avg_australia' "
+            "ORDER BY ordinal_position"
+        )
+        assert set(cols) == {
+            "month", "monthly_revenue_gbp", "rolling_3m_avg_gbp", "loaded_at",
+        }
+
+    def test_loaded_at_column_populated(self, dag_run_id):
+        null_count = _pg_scalar(
+            "SELECT COUNT(*) FROM sql_rolling_3m_avg_australia WHERE loaded_at IS NULL"
+        )
+        assert null_count == 0
+
+    def test_first_month_rolling_avg_equals_monthly_revenue(self, dag_run_id):
+        """
+        First month with Australia data: rolling avg = its own revenue
+        (only one non-NULL value in the 3-row window).
+        Rows with no Australia sales have NULL monthly_revenue_gbp —
+        the first non-NULL row is where the rolling avg equals the revenue.
+        """
+        row = _pg_scalar(
+            "SELECT monthly_revenue_gbp = rolling_3m_avg_gbp "
+            "FROM sql_rolling_3m_avg_australia "
+            "WHERE monthly_revenue_gbp IS NOT NULL "
+            "ORDER BY month "
+            "LIMIT 1"
+        )
+        assert row is True, (
+            "First Australia revenue month: rolling_3m_avg_gbp should equal monthly_revenue_gbp"
+        )

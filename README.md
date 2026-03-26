@@ -19,6 +19,12 @@ End-to-end data pipeline using **Apache Spark**, **Apache Airflow**, and **Postg
 │       ├── clean_and_ingest.py     # PySpark: cleaning, PII anonymisation, PostgreSQL write
 │       └── analysis.py             # PySpark: total revenue, top-10 products, monthly trend
 ├── sql/
+│   ├── ddl/                                # DDL files: one CREATE TABLE IF NOT EXISTS per output table
+│   │   ├── retail_transactions.sql
+│   │   ├── analysis_top10_products.sql
+│   │   ├── analysis_monthly_revenue.sql
+│   │   ├── sql_top_3_products_last_6m.sql
+│   │   └── sql_rolling_3m_avg_australia.sql
 │   ├── init_db.sh                      # Creates airflow + retail databases on first Postgres start
 │   ├── top_3_products_last_6m.sql      # SQL: top-3 products by revenue per month (last 6 months)
 │   ├── rolling_3m_avg_australia.sql    # SQL: rolling 3-month average revenue for Australia
@@ -70,6 +76,9 @@ This builds the custom Airflow image (adds OpenJDK 17, PySpark 3.5, and the Spar
 docker compose up -d postgres spark-master spark-worker && sleep 12 && docker compose ps
 ```
 
+- `-d` detached mode. Containers start in the background and your terminal returns immediately.
+- `ps`: print status of all running services
+
 ---
 
 ## 4 — Initialise Airflow
@@ -79,6 +88,8 @@ Run once to create the Airflow metadata schema and the `admin` user:
 ```bash
 docker compose run --rm airflow-init
 ```
+
+- `rm`: remoeves the container once the one-off setup task is done running
 
 Expected output ends with: `[airflow-init] Initialisation complete.`
 
@@ -138,18 +149,32 @@ docker compose exec postgres \
 Useful queries after the pipeline has run:
 
 ```sql
--- Cleaned transactions
+-- List all tables in the current database
+\dt
+
+-- Cleaned transactions (latest pipeline run)
 SELECT COUNT(*), COUNT(DISTINCT invoice_no), MIN(invoice_date), MAX(invoice_date)
-FROM retail_transactions;
+FROM retail_transactions
+WHERE loaded_at = (SELECT MAX(loaded_at) FROM retail_transactions);
 
--- Top 10 products saved by PySpark analysis job
-SELECT * FROM analysis_top10_products ORDER BY quantity_sold DESC;
+-- Top 10 products (latest pipeline run)
+SELECT * FROM analysis_top10_products
+WHERE loaded_at = (SELECT MAX(loaded_at) FROM analysis_top10_products)
+ORDER BY quantity_sold DESC;
 
--- Monthly revenue trend
-SELECT * FROM analysis_monthly_revenue ORDER BY year_month;
+-- Monthly revenue trend (latest pipeline run)
+SELECT * FROM analysis_monthly_revenue
+WHERE loaded_at = (SELECT MAX(loaded_at) FROM analysis_monthly_revenue)
+ORDER BY year_month;
 
--- Run the SQL analysis queries directly
-\i /path/to/sql/analysis.sql
+-- SQL analysis results (latest pipeline run)
+SELECT * FROM sql_top_3_products_last_6m
+WHERE loaded_at = (SELECT MAX(loaded_at) FROM sql_top_3_products_last_6m)
+ORDER BY month DESC, revenue_rank;
+
+SELECT * FROM sql_rolling_3m_avg_australia
+WHERE loaded_at = (SELECT MAX(loaded_at) FROM sql_rolling_3m_avg_australia)
+ORDER BY month;
 ```
 
 ---
@@ -234,7 +259,7 @@ The test runner:
 1. Cancels any lingering active DAG runs (avoids `max_active_runs=1` blocking)
 2. Triggers a fresh manual run
 3. Polls every 15 s until the DAG succeeds or fails (timeout: 15 min)
-4. Asserts all 4 tasks succeeded
+4. Asserts all 5 tasks succeeded
 5. Queries PostgreSQL to verify `retail_transactions`, `analysis_top10_products`, and `analysis_monthly_revenue`
 
 Expected output ends with:
@@ -324,17 +349,39 @@ docker compose down -v
 ### Pipeline DAG
 
 ```
-ingest_and_clean  ──► run_pyspark_analysis
-                  ──► sql_top_3_products_last_6m
-                  ──► sql_rolling_3m_avg_australia
+                                         ┌─► run_pyspark_analysis
+create_tables ──► ingest_and_clean ──────┤
+                                         ├─► sql_top_3_products_last_6m
+                                         └─► sql_rolling_3m_avg_australia
 ```
 
 | Task | Tool | Description |
 |------|------|-------------|
-| `ingest_and_clean` | SparkSubmitOperator | Reads CSV, cleans data, anonymises CustomerID (PII), writes to `retail_transactions` |
-| `run_pyspark_analysis` | SparkSubmitOperator | Reads from PostgreSQL; computes total revenue, top-10 products, monthly trend |
-| `sql_top_3_products_last_6m` | PythonOperator | Top 3 products by revenue per month (last 6 months); reads SQL file, executes once, logs results |
-| `sql_rolling_3m_avg_australia` | PythonOperator | Rolling 3-month average revenue for Australia; reads SQL file, executes once, logs results |
+| `create_tables` | PythonOperator | Applies every DDL file in `sql/ddl/` (`CREATE TABLE IF NOT EXISTS`) so all output tables exist with precise column types before any data is written |
+| `ingest_and_clean` | SparkSubmitOperator | Reads CSV, cleans data, anonymises CustomerID (PII), appends to `retail_transactions` |
+| `run_pyspark_analysis` | SparkSubmitOperator | Reads from PostgreSQL; computes total revenue, top-10 products, monthly trend; appends to `analysis_top10_products` and `analysis_monthly_revenue` |
+| `sql_top_3_products_last_6m` | PythonOperator | Executes `top_3_products_last_6m.sql`, logs sample rows, appends full result to `sql_top_3_products_last_6m` |
+| `sql_rolling_3m_avg_australia` | PythonOperator | Executes `rolling_3m_avg_australia.sql`, logs sample rows, appends full result to `sql_rolling_3m_avg_australia` |
+
+---
+
+## Generated tables
+
+All tables live in the `retail` PostgreSQL database and use **Type 2 append**: every pipeline run inserts new rows tagged with `loaded_at`. No data is ever overwritten or deleted. To query the latest snapshot for any table use:
+
+```sql
+WHERE loaded_at = (SELECT MAX(loaded_at) FROM <table>)
+```
+
+| Table | Written by | Columns |
+|-------|------------|---------|
+| `retail_transactions` | `ingest_and_clean` | `invoice_no`, `stock_code`, `description`, `quantity`, `invoice_date`, `unit_price`, `customer_id`, `country`, `revenue`, `is_cancellation`, **`loaded_at`** |
+| `analysis_top10_products` | `run_pyspark_analysis` | `stock_code`, `quantity_sold`, **`loaded_at`** |
+| `analysis_monthly_revenue` | `run_pyspark_analysis` | `year_month`, `monthly_revenue`, `num_transactions`, `num_customers`, `mom_growth_pct`, `yoy_growth_pct`, `rolling_3m_avg`, `rev_sigma_dist`, `mom_sigma_dist`, **`loaded_at`** |
+| `sql_top_3_products_last_6m` | `sql_top_3_products_last_6m` | `month TEXT`, `stock_code TEXT`, `description TEXT`, `total_revenue_gbp NUMERIC`, `revenue_rank BIGINT`, **`loaded_at TIMESTAMP`** |
+| `sql_rolling_3m_avg_australia` | `sql_rolling_3m_avg_australia` | `month TEXT`, `monthly_revenue_gbp NUMERIC`, `rolling_3m_avg_gbp NUMERIC`, **`loaded_at TIMESTAMP`** |
+
+> **Column types** are defined explicitly in `sql/ddl/` — one `CREATE TABLE IF NOT EXISTS` file per table. The `create_tables` DAG task applies these files before any data is written, so every table is created with precise types (e.g. `BIGINT`, `NUMERIC`, `DOUBLE PRECISION`) rather than relying on Spark or cursor inference.
 
 ---
 

@@ -71,10 +71,19 @@ def create_spark_session(app_name: str = "RetailAnalysis") -> SparkSession:
 
 
 def load_from_postgres(spark: SparkSession, table: str) -> DataFrame:
-    """Load a table from PostgreSQL into a Spark DataFrame."""
+    """Load the latest batch from a PostgreSQL table into a Spark DataFrame.
+
+    The table uses Type 2 append: every pipeline run adds rows tagged with
+    loaded_at.  We scope to MAX(loaded_at) so aggregations only see one
+    consistent snapshot and are not inflated by rows from prior runs.
+    """
+    latest_batch = (
+        f"(SELECT * FROM {table}"
+        f" WHERE loaded_at = (SELECT MAX(loaded_at) FROM {table})) AS latest"
+    )
     return spark.read.jdbc(
         url=POSTGRES_URL,
-        table=table,
+        table=latest_batch,
         properties=POSTGRES_PROPS,
     )
 
@@ -215,6 +224,7 @@ def get_monthly_revenue_trend(df: DataFrame) -> DataFrame:
         # --- Rolling 3-month average (reference baseline displayed in output) ---
         .withColumn("rolling_3m_avg", F.round(F.avg("monthly_revenue").over(w3), 2))
         # --- Anomaly indicator 1: revenue level z-score (6-month window) ---
+        # z-score = how many standard deviations a value is from the mean.
         # A 6-month window gives a more stable baseline than 3 months.
         # With 3 months, a single outlier dominates the std and shrinks its
         # own sigma-distance toward zero (self-normalisation).  With 6 months
@@ -363,11 +373,16 @@ def print_monthly_insights(monthly_df: DataFrame) -> None:
 
 
 def save_to_postgres(df: DataFrame, table: str) -> None:
-    """Persist a result DataFrame to PostgreSQL, overwriting any prior run."""
-    df.write.jdbc(
+    """Append a result DataFrame to PostgreSQL with a loaded_at timestamp.
+
+    Each pipeline run appends its rows tagged with the current UTC timestamp so
+    that runs can be distinguished. Query the latest snapshot with:
+        WHERE loaded_at = (SELECT MAX(loaded_at) FROM <table>)
+    """
+    df.withColumn("loaded_at", F.current_timestamp()).write.jdbc(
         url=POSTGRES_URL,
         table=table,
-        mode="overwrite",
+        mode="append",
         properties=POSTGRES_PROPS,
     )
 

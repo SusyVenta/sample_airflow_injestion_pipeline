@@ -138,8 +138,8 @@ services:
     hostname: spark-worker
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
     environment:
-      - SPARK_WORKER_MEMORY=2g
-      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g # the csv is ~43MB uncompressed — fits in 2g with room for Spark overhead
+      - SPARK_WORKER_CORES=2 # can run 2 parallel tasks
     depends_on:
       - spark-master
     volumes:

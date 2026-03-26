@@ -2,11 +2,13 @@
 clean_and_ingest.py
 -------------------
 PySpark script that:
-  1. Loads the raw Online Retail CSV dataset.
+  1. Loads the raw Online Retail CSV dataset using an explicit schema (RETAIL_CSV_SCHEMA)
+     by default, eliminating type ambiguity and the two-pass cost of inferSchema.
   2. Applies a cleaning pipeline (missing values, duplicates, type coercion, anomalies).
   3. Anonymises CustomerID (PII) via SHA-256 hashing.
   4. Recalculates Revenue to fix floating-point inconsistencies.
-  5. Writes the cleaned data to a PostgreSQL table via JDBC.
+  5. Appends the cleaned data to a PostgreSQL table via JDBC, tagging every row with
+     a loaded_at timestamp so pipeline runs can be distinguished.
 
 Run standalone:
     spark-submit \\
@@ -29,7 +31,13 @@ from typing import Dict
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, StringType, TimestampType
+from pyspark.sql.types import (
+    DoubleType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -55,6 +63,31 @@ POSTGRES_PROPS: Dict[str, str] = {
 TARGET_TABLE: str = "retail_transactions"
 
 # ---------------------------------------------------------------------------
+# Enforced CSV schema
+# ---------------------------------------------------------------------------
+# Preferred over inferSchema=True because:
+#   - Single-pass read: inferSchema scans the file twice.
+#   - CustomerID is loaded as StringType, eliminating the '.0' artifact that
+#     inferSchema introduces when it infers the column as DoubleType.
+#   - InvoiceDate is loaded as StringType; cast_types() converts it to
+#     TimestampType downstream, handling the non-ISO date format in the CSV.
+#   - Deterministic: schema never changes between runs regardless of data sample.
+
+RETAIL_CSV_SCHEMA: StructType = StructType(
+    [
+        StructField("InvoiceNo", StringType(), True),
+        StructField("StockCode", StringType(), True),
+        StructField("Description", StringType(), True),
+        StructField("Quantity", DoubleType(), True),
+        StructField("InvoiceDate", StringType(), True),
+        StructField("UnitPrice", DoubleType(), True),
+        StructField("CustomerID", StringType(), True),
+        StructField("Country", StringType(), True),
+        StructField("Revenue", DoubleType(), True),
+    ]
+)
+
+# ---------------------------------------------------------------------------
 # Spark session
 # ---------------------------------------------------------------------------
 
@@ -74,8 +107,19 @@ def create_spark_session(app_name: str = "RetailDataCleaning") -> SparkSession:
 # ---------------------------------------------------------------------------
 
 
-def load_raw_data(spark: SparkSession, path: str) -> DataFrame:
-    """Load the raw CSV with header and schema inference."""
+def load_raw_data(
+    spark: SparkSession,
+    path: str,
+    enforce_schema: bool = True,
+) -> DataFrame:
+    """Load the raw CSV.
+
+    enforce_schema=True (default): applies RETAIL_CSV_SCHEMA explicitly.
+    enforce_schema=False: falls back to Spark's automatic schema inference
+    (two-pass read; types may vary across runs and data samples).
+    """
+    if enforce_schema:
+        return spark.read.csv(path, header=True, schema=RETAIL_CSV_SCHEMA)
     return spark.read.csv(path, header=True, inferSchema=True)
 
 
@@ -253,16 +297,17 @@ def clean_data(df: DataFrame) -> DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def load_to_postgres(
-    df: DataFrame,
-    table: str,
-    mode: str = "overwrite",
-) -> None:
-    """Write a DataFrame to PostgreSQL via JDBC."""
-    df.write.jdbc(
+def load_to_postgres(df: DataFrame, table: str) -> None:
+    """Append a DataFrame to PostgreSQL via JDBC with a loaded_at timestamp.
+
+    Each pipeline run appends its rows tagged with the current UTC timestamp so
+    that runs can be distinguished. Query the latest snapshot with:
+        WHERE loaded_at = (SELECT MAX(loaded_at) FROM <table>)
+    """
+    df.withColumn("loaded_at", F.current_timestamp()).write.jdbc(
         url=POSTGRES_URL,
         table=table,
-        mode=mode,
+        mode="append",
         properties=POSTGRES_PROPS,
     )
 
